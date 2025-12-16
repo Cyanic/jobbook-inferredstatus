@@ -231,15 +231,14 @@ function scoreStatuses(row, statusOrder, statusIndex) {
   return scores;
 }
 
-function roleCapIndex(row, statusIndex, floorIdx) {
+function roleCapIndex(row, statusIndex) {
   let capIdx = Infinity;
   ROLE_MAX_STATUS.forEach((cap) => {
     if (!cap.match.test(row[ROLE_FIELD] || '')) return;
     const idx = statusIndex.get(cap.maxStatus);
     if (typeof idx === 'number') capIdx = Math.min(capIdx, idx);
   });
-  if (capIdx === Infinity) return floorIdx;
-  return Math.max(floorIdx, capIdx);
+  return capIdx;
 }
 
 function pickStatusFromSignals(row, floorIdx, capIdx, statusOrder, statusIndex) {
