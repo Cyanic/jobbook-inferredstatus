@@ -1,0 +1,15 @@
+order,job_status
+1,Estimating
+2,Job Setup
+3,Ready to Schedule
+4,Scheduled
+5,On Hold
+6,Field Work in Progress
+7,Ready to Draft
+8,Drafting
+9,Ready to Check
+10,Checking
+11,Final Submission Sent
+12,Ready to Invoice
+13,Invoiced
+14,Complete
