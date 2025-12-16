@@ -49,10 +49,22 @@ const STATUS_KEYWORDS = {
   Drafting: [/draft/, /survbase/, /cad/, /markup/, /dwg/, /plan/],
   'Ready to Check': [/ready to check/, /package ready/, /awaiting check/],
   Checking: [/check/, /qa/, /review/],
-  'Final Submission Sent': [/submission/, /deliver/, /sent/, /deliverable/],
+  'Final Submission Sent': [
+    /submission/,
+    /deliver/,
+    /sent/,
+    /deliverable/,
+    /package issued/,
+  ],
   'Ready to Invoice': [/ready to invoice/, /billing/, /billable/],
   Invoiced: [/invoic/],
-  Complete: [/complete/, /finished/, /closeout/],
+  Complete: [
+    /project complete/,
+    /job complete/,
+    /closeout/,
+    /final invoice/,
+    /finalized/,
+  ],
 };
 
 // Role → status affinity provides a strong signal when job roles correlate
@@ -66,6 +78,15 @@ const ROLE_STATUS_MAP = [
   { match: /cad|draft|designer|survbase|markup/i, statuses: ['Drafting', 'Ready to Check'], weight: 3 },
   { match: /manager|project manager|pm/i, statuses: ['Checking', 'Final Submission Sent'], weight: 2.5 },
   { match: /accounting|billing|finance|ap|ar|invoice/i, statuses: ['Ready to Invoice', 'Invoiced'], weight: 3 },
+];
+
+// Upper bounds for how far a row should advance based on the labour role.
+// This prevents field roles from being marked Complete solely due to wording.
+const ROLE_MAX_STATUS = [
+  { match: /survey|field|technician|technologist/i, maxStatus: 'Field Work in Progress' },
+  { match: /data processing|processing|lidar/i, maxStatus: 'Drafting' },
+  { match: /cad|draft|designer|survbase|markup/i, maxStatus: 'Drafting' },
+  { match: /manager|project manager|pm/i, maxStatus: 'Final Submission Sent' },
 ];
 
 function parseArgs(argv) {
@@ -210,13 +231,24 @@ function scoreStatuses(row, statusOrder, statusIndex) {
   return scores;
 }
 
-function pickStatusFromSignals(row, floorIdx, statusOrder, statusIndex) {
+function roleCapIndex(row, statusIndex, floorIdx) {
+  let capIdx = Infinity;
+  ROLE_MAX_STATUS.forEach((cap) => {
+    if (!cap.match.test(row[ROLE_FIELD] || '')) return;
+    const idx = statusIndex.get(cap.maxStatus);
+    if (typeof idx === 'number') capIdx = Math.min(capIdx, idx);
+  });
+  if (capIdx === Infinity) return floorIdx;
+  return Math.max(floorIdx, capIdx);
+}
+
+function pickStatusFromSignals(row, floorIdx, capIdx, statusOrder, statusIndex) {
   const scores = scoreStatuses(row, statusOrder, statusIndex);
   let best = null;
 
   scores.forEach((score, status) => {
     const idx = statusIndex.get(status);
-    if (idx < floorIdx) return;
+    if (idx < floorIdx || idx > capIdx) return;
     if (score <= 0) return;
     if (!best || score > best.score || (score === best.score && idx > best.idx)) {
       best = { idx, status, score };
@@ -260,15 +292,16 @@ function inferStatuses(rows, statusSet, statusOrder, statusIndex) {
         return;
       }
 
+      const capIdx = roleCapIndex(row, statusIndex, currentIdx);
       const status = row[STATUS_FIELD];
       const explicitIdx = statusIndex.get(status);
       if (typeof explicitIdx === 'number') {
-        currentIdx = Math.max(currentIdx, explicitIdx);
+        currentIdx = Math.min(Math.max(currentIdx, explicitIdx), capIdx);
       }
 
-      const signalIdx = pickStatusFromSignals(row, currentIdx, statusOrder, statusIndex);
+      const signalIdx = pickStatusFromSignals(row, currentIdx, capIdx, statusOrder, statusIndex);
       if (signalIdx !== null) {
-        currentIdx = Math.max(currentIdx, signalIdx);
+        currentIdx = Math.min(Math.max(currentIdx, signalIdx), capIdx);
       }
 
       current = statusOrder[currentIdx] || current;
