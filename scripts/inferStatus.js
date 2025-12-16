@@ -10,6 +10,63 @@ const DWR_FIELD = 'dwrNumber';
 const ORDER_FILE = path.join(__dirname, '..', 'data', 'job_status_order.csv');
 const DEFAULT_OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const DEFAULT_FALLBACK_STATUS = 'Estimating';
+const DESCRIPTION_FIELD = 'timeCard.description';
+const ROLE_FIELD = 'labour.name';
+
+// Keywords mapped to the status they most strongly suggest. Order must match
+// the canonical order to preserve the monotone progression during inference.
+const STATUS_KEYWORDS = {
+  Estimating: [
+    /estimate/,
+    /proposal/,
+    /bid/,
+    /pricing/,
+    /rfp/,
+  ],
+  'Job Setup': [/setup/, /conversion/, /onboard/, /kickoff/],
+  'Ready to Schedule': [/ready to schedule/, /project conversion/, /mobilize/],
+  Scheduled: [/schedule/, /scheduled/, /booking/, /calendar/],
+  'On Hold': [/hold/, /paused?/],
+  'Field Work in Progress': [
+    /travel/,
+    /site/,
+    /field/,
+    /collect/,
+    /survey/,
+    /scan/,
+    /locat/,
+    /inspection/,
+    /safety/,
+  ],
+  'Ready to Draft': [
+    /processing/,
+    /register/,
+    /ortho/,
+    /clean/,
+    /qc/,
+    /convert/,
+  ],
+  Drafting: [/draft/, /survbase/, /cad/, /markup/, /dwg/, /plan/],
+  'Ready to Check': [/ready to check/, /package ready/, /awaiting check/],
+  Checking: [/check/, /qa/, /review/],
+  'Final Submission Sent': [/submission/, /deliver/, /sent/, /deliverable/],
+  'Ready to Invoice': [/ready to invoice/, /billing/, /billable/],
+  Invoiced: [/invoic/],
+  Complete: [/complete/, /finished/, /closeout/],
+};
+
+// Role → status affinity provides a strong signal when job roles correlate
+// tightly to a stage. The weights here are larger than keyword scores to
+// prioritize role-based inference when available.
+const ROLE_STATUS_MAP = [
+  { match: /estimating|proposal|bd|business development/i, statuses: ['Estimating', 'Job Setup'], weight: 3 },
+  { match: /administrator|admin/i, statuses: ['Job Setup', 'Ready to Schedule'], weight: 2.5 },
+  { match: /survey|field|technician|technologist/i, statuses: ['Field Work in Progress'], weight: 3 },
+  { match: /data processing|processing|lidar/i, statuses: ['Ready to Draft', 'Drafting'], weight: 3 },
+  { match: /cad|draft|designer|survbase|markup/i, statuses: ['Drafting', 'Ready to Check'], weight: 3 },
+  { match: /manager|project manager|pm/i, statuses: ['Checking', 'Final Submission Sent'], weight: 2.5 },
+  { match: /accounting|billing|finance|ap|ar|invoice/i, statuses: ['Ready to Invoice', 'Invoiced'], weight: 3 },
+];
 
 function parseArgs(argv) {
   const args = {};
@@ -90,6 +147,12 @@ function loadStatusOrder() {
     .map((r) => r[statusIdx].trim());
 }
 
+function buildStatusIndex(orderList) {
+  const index = new Map();
+  orderList.forEach((status, i) => index.set(status, i));
+  return index;
+}
+
 function buildStatusSet(orderList) {
   const set = new Set(orderList);
   if (!set.has(DEFAULT_FALLBACK_STATUS) && orderList.length > 0) {
@@ -103,7 +166,67 @@ function safeDate(value) {
   return Number.isNaN(time) ? null : new Date(time);
 }
 
-function inferStatuses(rows, statusSet) {
+function isEmptyRow(row) {
+  return Object.values(row).every((value) => value === '' || value === undefined);
+}
+
+function combineRowText(row) {
+  const parts = [
+    row[STATUS_FIELD],
+    row[ROLE_FIELD],
+    row[DESCRIPTION_FIELD],
+    typeof row.additionalFields === 'string' ? row.additionalFields : '',
+  ];
+  return parts
+    .filter((p) => typeof p === 'string' && p.trim().length > 0)
+    .join(' ')
+    .toLowerCase();
+}
+
+function scoreStatuses(row, statusOrder, statusIndex) {
+  const scores = new Map();
+  statusOrder.forEach((status) => scores.set(status, 0));
+
+  const text = combineRowText(row);
+  Object.entries(STATUS_KEYWORDS).forEach(([status, patterns]) => {
+    if (!statusIndex.has(status)) return;
+    let score = 0;
+    patterns.forEach((pattern) => {
+      if (pattern.test(text)) score += 1;
+    });
+    if (score > 0) {
+      scores.set(status, scores.get(status) + score);
+    }
+  });
+
+  ROLE_STATUS_MAP.forEach((hint) => {
+    if (!hint.match.test(row[ROLE_FIELD] || '')) return;
+    hint.statuses.forEach((status) => {
+      if (!statusIndex.has(status)) return;
+      scores.set(status, scores.get(status) + hint.weight);
+    });
+  });
+
+  return scores;
+}
+
+function pickStatusFromSignals(row, floorIdx, statusOrder, statusIndex) {
+  const scores = scoreStatuses(row, statusOrder, statusIndex);
+  let best = null;
+
+  scores.forEach((score, status) => {
+    const idx = statusIndex.get(status);
+    if (idx < floorIdx) return;
+    if (score <= 0) return;
+    if (!best || score > best.score || (score === best.score && idx > best.idx)) {
+      best = { idx, status, score };
+    }
+  });
+
+  return best ? best.idx : null;
+}
+
+function inferStatuses(rows, statusSet, statusOrder, statusIndex) {
   const assignments = new Map();
   const groups = new Map();
 
@@ -117,6 +240,7 @@ function inferStatuses(rows, statusSet) {
     let current = statusSet.has(DEFAULT_FALLBACK_STATUS)
       ? DEFAULT_FALLBACK_STATUS
       : statusSet.values().next().value;
+    let currentIdx = statusIndex.get(current) ?? 0;
 
     entries.sort((a, b) => {
       const dateA = safeDate(a.row[DATE_FIELD]);
@@ -131,10 +255,23 @@ function inferStatuses(rows, statusSet) {
     });
 
     entries.forEach(({ row, index }) => {
-      const status = row[STATUS_FIELD];
-      if (statusSet.has(status)) {
-        current = status;
+      if (isEmptyRow(row)) {
+        assignments.set(index, '');
+        return;
       }
+
+      const status = row[STATUS_FIELD];
+      const explicitIdx = statusIndex.get(status);
+      if (typeof explicitIdx === 'number') {
+        currentIdx = Math.max(currentIdx, explicitIdx);
+      }
+
+      const signalIdx = pickStatusFromSignals(row, currentIdx, statusOrder, statusIndex);
+      if (signalIdx !== null) {
+        currentIdx = Math.max(currentIdx, signalIdx);
+      }
+
+      current = statusOrder[currentIdx] || current;
       assignments.set(index, current);
     });
   });
@@ -193,8 +330,9 @@ function main() {
 
   const orderList = loadStatusOrder();
   const statusSet = buildStatusSet(orderList);
+  const statusIndex = buildStatusIndex(orderList);
   const { headers, rows } = readInputFile(inputPath);
-  const assignments = inferStatuses(rows, statusSet);
+  const assignments = inferStatuses(rows, statusSet, orderList, statusIndex);
   writeOutput(headers, rows, assignments, outputPath);
 
   console.log(`Wrote inferred statuses to ${outputPath}`);
